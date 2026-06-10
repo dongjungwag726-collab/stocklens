@@ -34,6 +34,18 @@ COLOR_FLAT = "#8B949E"   # 보합
 
 FONT_FAMILY = "Malgun Gothic"
 
+# 차트 패널
+CHART_PANEL_WIDTH = 400
+COLOR_MA5 = "#FFD700"    # 노랑
+COLOR_MA20 = "#4B8BFF"   # 파랑
+COLOR_MA60 = "#A371F7"   # 보라
+# lightweight-charts v4 (TradingView 오픈소스). 오프라인 사용 시
+# assets/lightweight-charts.standalone.production.js 로 교체 가능.
+LIGHTWEIGHT_CHARTS_CDN = (
+    "https://unpkg.com/lightweight-charts@4.1.3/dist/"
+    "lightweight-charts.standalone.production.js"
+)
+
 # ---------------------------------------------------------------------------
 # 한국 증시 운영 시간 (KST, UTC+9)
 # ---------------------------------------------------------------------------
