@@ -37,6 +37,13 @@ import config
 import watchlist as wl
 from data_fetcher import Quote
 
+try:
+    from chart_panel import ChartPanel
+    CHART_AVAILABLE = True
+except Exception:  # PyQt6-WebEngine 미설치 등
+    ChartPanel = None  # type: ignore
+    CHART_AVAILABLE = False
+
 
 def fmt_won(value: float | None) -> str:
     if value is None:
@@ -73,6 +80,7 @@ class TickerRow(QFrame):
 
     delete_requested = pyqtSignal(str)  # ticker
     move_requested = pyqtSignal(str, int)  # ticker, delta (-1 위로 / +1 아래로)
+    selected = pyqtSignal(str, str)  # ticker, name (차트 대상 선택)
 
     def __init__(self, entry: dict, parent=None) -> None:
         super().__init__(parent)
@@ -164,6 +172,11 @@ class TickerRow(QFrame):
         )
 
     # ------------------------------------------------------------------
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.ticker, self.name)
+        super().mousePressEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:
         self.toggle_expand()
         event.accept()
@@ -253,6 +266,9 @@ class OverlayWindow(QWidget):
         super().__init__()
         self._watchlist = wl.load_watchlist()
         self._rows: dict[str, TickerRow] = {}
+        self._chart_open = False
+        self._chart_symbol: dict | None = None
+        self._chart_anim = None
 
         self.setWindowTitle(config.APP_NAME)
         self.setWindowFlags(
@@ -271,7 +287,14 @@ class OverlayWindow(QWidget):
 
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        root = QVBoxLayout(self)
+        # 최상위는 수평: [본문][화살표][차트 패널]
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._content = QWidget()
+        self._content.setObjectName("contentArea")
+        root = QVBoxLayout(self._content)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
@@ -348,6 +371,26 @@ class OverlayWindow(QWidget):
         grip_row.addWidget(QSizeGrip(self))
         root.addLayout(grip_row)
 
+        # 본문 + 차트 토글 화살표 + 차트 패널 조립
+        outer.addWidget(self._content)
+
+        self.chart_btn = QPushButton("◀")
+        self.chart_btn.setObjectName("chartToggle")
+        self.chart_btn.setFixedWidth(16)
+        self.chart_btn.setToolTip("차트 패널 열기/닫기")
+        self.chart_btn.clicked.connect(self._toggle_chart)
+        outer.addWidget(self.chart_btn)
+
+        if CHART_AVAILABLE:
+            self.chart_panel = ChartPanel()
+            self.chart_panel.setMaximumWidth(0)
+            self.chart_panel.setMinimumWidth(0)
+            outer.addWidget(self.chart_panel)
+        else:
+            self.chart_panel = None
+            self.chart_btn.setEnabled(False)
+            self.chart_btn.setToolTip("PyQt6-WebEngine 미설치 — 차트 비활성")
+
     def _apply_style(self) -> None:
         self.setStyleSheet(f"""
             QWidget {{
@@ -402,6 +445,15 @@ class OverlayWindow(QWidget):
             #addBtn:hover, #brokerBtn:hover {{
                 background-color: {config.COLOR_ACCENT};
             }}
+            #chartToggle {{
+                background-color: {config.COLOR_HANDLE};
+                color: {config.COLOR_TEXT};
+                border: none;
+                border-left: 1px solid #21262D;
+                font-size: 11px;
+            }}
+            #chartToggle:hover {{ background-color: {config.COLOR_ACCENT}; }}
+            #chartToggle:disabled {{ color: #30363D; }}
             #scroll {{ border: none; }}
             QScrollBar:vertical {{
                 background: {config.COLOR_BG};
@@ -437,6 +489,7 @@ class OverlayWindow(QWidget):
         row = TickerRow(entry)
         row.delete_requested.connect(self._on_delete)
         row.move_requested.connect(self._on_move)
+        row.selected.connect(self._on_select_symbol)
         # stretch 앞(= count-1)에 삽입
         self.list_layout.insertWidget(self.list_layout.count() - 1, row)
         self._rows[entry["ticker"]] = row
@@ -517,6 +570,49 @@ class OverlayWindow(QWidget):
 
     def _on_opacity(self, value: int) -> None:
         self.setWindowOpacity(max(0.1, value / 100.0))
+
+    # ------------------------------------------------------------------
+    # 차트 패널
+    # ------------------------------------------------------------------
+    def _on_select_symbol(self, ticker: str, name: str) -> None:
+        self._chart_symbol = {"ticker": ticker, "name": name}
+        if self.chart_panel is not None and self._chart_open:
+            self.chart_panel.set_symbol(ticker, name)
+
+    def _toggle_chart(self) -> None:
+        if self.chart_panel is None:
+            return
+        self._chart_open = not self._chart_open
+
+        if self._chart_open:
+            sym = self._chart_symbol or (
+                self._watchlist[0] if self._watchlist else None
+            )
+            if sym:
+                self._chart_symbol = sym
+                self.chart_panel.set_symbol(sym["ticker"], sym.get("name", ""))
+            self.chart_btn.setText("▶")
+            target = config.CHART_PANEL_WIDTH
+        else:
+            self.chart_btn.setText("◀")
+            target = 0
+
+        start = self.chart_panel.maximumWidth()
+        base = self.width() - start  # 본문+화살표 폭은 고정 유지
+
+        anim = QPropertyAnimation(self.chart_panel, b"maximumWidth", self)
+        anim.setDuration(220)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        anim.setStartValue(start)
+        anim.setEndValue(target)
+
+        def on_val(v):
+            self.chart_panel.setMinimumWidth(int(v))
+            self.resize(base + int(v), self.height())
+
+        anim.valueChanged.connect(on_val)
+        anim.start()
+        self._chart_anim = anim  # GC 방지
 
     def sizeHint(self) -> QSize:
         return QSize(config.DEFAULT_WINDOW_WIDTH, config.DEFAULT_WINDOW_HEIGHT)
