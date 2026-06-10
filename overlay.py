@@ -40,7 +40,7 @@ from data_fetcher import Quote
 try:
     from chart_panel import ChartPanel
     CHART_AVAILABLE = True
-except Exception:  # PyQt6-WebEngine 미설치 등
+except Exception:  # pyqtgraph/numpy 미설치 등
     ChartPanel = None  # type: ignore
     CHART_AVAILABLE = False
 
@@ -389,7 +389,7 @@ class OverlayWindow(QWidget):
         else:
             self.chart_panel = None
             self.chart_btn.setEnabled(False)
-            self.chart_btn.setToolTip("PyQt6-WebEngine 미설치 — 차트 비활성")
+            self.chart_btn.setToolTip("pyqtgraph 미설치 — 차트 비활성")
 
     def _apply_style(self) -> None:
         self.setStyleSheet(f"""
