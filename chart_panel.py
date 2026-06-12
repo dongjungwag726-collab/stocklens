@@ -1,10 +1,11 @@
+# chart_panel.py
 """슬라이딩 차트 패널 — pyqtgraph 렌더링.
 
 QWebEngineView 대신 pyqtgraph 로 네이티브 렌더링하여 Python 3.13 DLL 문제를 회피.
 오버레이 우측에서 펼쳐지는 토스증권 스타일 차트.
 - 캔들 / 선 / 영역 전환, MA5·MA20·MA60, 거래량, 전일 종가 기준선
 - 크로스헤어 OHLCV 툴팁, 최고/최저가 마커
-- 기간 탭(1일/1주/1개월/3개월/1년), 마우스 휠 줌·드래그 스크롤(pyqtgraph 내장)
+- 기간 탭(1일/1주/1개월/3개월/1년/전체), 마우스 휠 줌·드래그 스크롤(pyqtgraph 내장)
 - 차트 더블클릭 시 컨트롤 바 토글, '정보' 버튼으로 종목 정보 패널 토글
 """
 
@@ -28,14 +29,23 @@ from PyQt6.QtWidgets import (
 )
 
 import config
-from data_fetcher import ChartFetchThread
+from data_fetcher import ChartFetchThread, ReturnsFetchThread
 
 # pyqtgraph 전역 설정 (다크 테마)
 pg.setConfigOptions(antialias=True, background=config.COLOR_BG,
                     foreground=config.COLOR_TEXT)
 
-# 기간 (키, 표시 라벨, 등락률 계산용 calendar days)
-PERIODS = [
+# 차트 표시용 기간 버튼 (키, 라벨)
+PERIOD_BUTTONS = [
+    ("1D", "1일"),
+    ("1W", "1주"),
+    ("1M", "1개월"),
+    ("3M", "3개월"),
+    ("1Y", "1년"),
+    ("ALL", "전체"),
+]
+# 등락률 라벨용 (키, 라벨, calendar days) — 항상 1년 일봉 기준으로 계산
+RETURN_PERIODS = [
     ("1D", "1일", 1),
     ("1W", "1주", 7),
     ("1M", "1개월", 30),
@@ -136,11 +146,11 @@ class TimeAxisItem(pg.AxisItem):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._times: list[int] = []
-        self._intraday = False
+        self._fmt = "%m/%d"
 
-    def set_times(self, times: list[int], intraday: bool) -> None:
+    def set_times(self, times: list[int], fmt: str) -> None:
         self._times = times
-        self._intraday = intraday
+        self._fmt = fmt
         self.picture = None
         self.update()
 
@@ -149,9 +159,9 @@ class TimeAxisItem(pg.AxisItem):
         for v in values:
             i = int(round(v))
             if 0 <= i < len(self._times):
-                d = datetime.fromtimestamp(self._times[i])
-                out.append(d.strftime("%H:%M") if self._intraday
-                           else d.strftime("%m/%d"))
+                out.append(
+                    datetime.fromtimestamp(self._times[i]).strftime(self._fmt)
+                )
             else:
                 out.append("")
         return out
@@ -184,8 +194,9 @@ class ChartPanel(QWidget):
         self._chart_type = "candle"
         self._ma = {5: True, 20: True, 60: True}
         self._volume = True
-        self._thread: ChartFetchThread | None = None
+        self._threads: list = []          # 실행 중 QThread 참조 (GC 방지)
         self._returns: dict[str, float] = {}
+        self._returns_bars: list[dict] = []  # 등락률 계산용 1년 일봉
         self._period_btns: dict = {}
 
         # 차트 데이터
@@ -193,6 +204,7 @@ class ChartPanel(QWidget):
         self._times: list[int] = []
         self._prev_close: float | None = None
         self._intraday = False
+        self._axis_fmt = "%m/%d"
 
         # 렌더링 아이템 핸들
         self._main_item = None
@@ -318,13 +330,13 @@ class ChartPanel(QWidget):
         self.returns_lbl.setWordWrap(True)
         root.addWidget(self.returns_lbl)
 
-        # 기간 선택 탭 (하단). 데이터 범위가 아니라 '선택 기간 수익률 강조'용.
+        # 기간 선택 탭 (하단). 선택 시 해당 기간/간격 데이터로 차트 재조회.
         period_bar = QHBoxLayout()
         period_bar.setContentsMargins(4, 2, 4, 4)
         period_bar.setSpacing(2)
         pg_group = QButtonGroup(self)
         pg_group.setExclusive(True)
-        for key, label, _days in PERIODS:
+        for key, label in PERIOD_BUTTONS:
             b = QPushButton(label)
             b.setObjectName("periodBtn")
             b.setCheckable(True)
@@ -404,22 +416,41 @@ class ChartPanel(QWidget):
         self._ticker = ticker
         self._name = name
         self.title_lbl.setText(name or ticker)
-        self._fetch()
+        self._fetch_returns()   # 등락률용 1년 일봉 (기간과 무관, 1회)
+        self._fetch_chart()     # 현재 선택 기간의 차트 데이터
 
     # ------------------------------------------------------------------
     # 데이터 조회
     # ------------------------------------------------------------------
-    def _fetch(self) -> None:
+    def _track(self, thread) -> None:
+        """실행 중 스레드를 참조 유지하고 종료 시 정리한다 (GC 방지)."""
+        self._threads.append(thread)
+        thread.finished.connect(
+            lambda: self._threads.remove(thread)
+            if thread in self._threads else None
+        )
+
+    def _fetch_chart(self) -> None:
         if not self._ticker:
             return
-        if self._thread is not None and self._thread.isRunning():
-            return
         self.title_lbl.setText(f"{self._name or self._ticker}  ⏳")
-        self._thread = ChartFetchThread(self._ticker, self._name)
-        self._thread.chart_ready.connect(self._on_chart)
-        self._thread.start()
+        t = ChartFetchThread(self._ticker, self._name, self._period)
+        t.chart_ready.connect(self._on_chart)
+        self._track(t)
+        t.start()
+
+    def _fetch_returns(self) -> None:
+        if not self._ticker:
+            return
+        t = ReturnsFetchThread(self._ticker)
+        t.returns_ready.connect(self._on_returns)
+        self._track(t)
+        t.start()
 
     def _on_chart(self, result: dict) -> None:
+        # 이전 기간의 늦은 응답은 무시
+        if result.get("period") and result.get("period") != self._period:
+            return
         name = result.get("name") or result.get("ticker", "")
         if result.get("error"):
             self.title_lbl.setText(f"{name}  (조회 실패)")
@@ -430,9 +461,13 @@ class ChartPanel(QWidget):
         self._times = [b["time"] for b in self._bars]
         self._prev_close = result.get("prev_close")
         self._intraday = bool(result.get("intraday", False))
+        self._axis_fmt = "%H:%M" if self._period == "1D" else "%m/%d"
 
         self._render_all()
         self._update_info(result.get("info", {}))
+
+    def _on_returns(self, bars: list) -> None:
+        self._returns_bars = bars or []
         self._compute_returns()
         self._render_returns()
 
@@ -440,16 +475,16 @@ class ChartPanel(QWidget):
     # 기간별 등락률
     # ------------------------------------------------------------------
     def _compute_returns(self) -> None:
-        """전체 히스토리에서 각 기간(1D/1W/1M/3M/1Y) 등락률(%)을 계산."""
+        """1년 일봉 시계열에서 각 기간(1D/1W/1M/3M/1Y) 등락률(%)을 계산."""
         self._returns = {}
-        bars = self._bars
+        bars = self._returns_bars
         if len(bars) < 2:
             return
         last = bars[-1]
         last_t, last_c = last["time"], last["close"]
         if not last_c:
             return
-        for key, _label, days in PERIODS:
+        for key, _label, days in RETURN_PERIODS:
             target = last_t - days * 86400
             past = None
             # 오름차순 → target 이하 중 가장 최근 봉을 고른다 (마지막 봉 제외)
@@ -467,7 +502,7 @@ class ChartPanel(QWidget):
     def _render_returns(self) -> None:
         """등락률 라벨을 그린다. 선택된 기간은 굵게 강조."""
         parts = []
-        for key, label, _days in PERIODS:
+        for key, label, _days in RETURN_PERIODS:
             pct = self._returns.get(key)
             if pct is None:
                 seg = f"{label} -"
@@ -487,7 +522,7 @@ class ChartPanel(QWidget):
     # 렌더링
     # ------------------------------------------------------------------
     def _render_all(self) -> None:
-        self.time_axis.set_times(self._times, self._intraday)
+        self.time_axis.set_times(self._times, self._axis_fmt)
         self._render_volume()
         self._render_ma()
         self._render_main()
@@ -638,56 +673,4 @@ class ChartPanel(QWidget):
             f"거래량 {b.get('volume', 0):,}{chg_str}</div>"
         )
         self.tooltip.setHtml(html)
-        # 커서가 우측 절반이면 왼쪽으로 펼치도록 anchor 전환
-        right_half = i > len(self._bars) / 2
-        self.tooltip.setAnchor((1, 1) if right_half else (0, 1))
-        self.tooltip.setPos(i, mp.y())
-
-    # ------------------------------------------------------------------
-    # 정보 패널
-    # ------------------------------------------------------------------
-    def _update_info(self, info: dict) -> None:
-        fmt = {
-            "price": _won, "change_pct": _pct, "volume": _num,
-            "market_cap": _cap, "per": _ratio, "pbr": _ratio,
-            "w52_high": _won, "w52_low": _won,
-            "day_open": _won, "day_high": _won, "day_low": _won,
-        }
-        for key, lbl in self._info_vals.items():
-            lbl.setText(fmt.get(key, str)(info.get(key)))
-        chg = info.get("change_pct")
-        if "change_pct" in self._info_vals and isinstance(chg, (int, float)):
-            color = (config.COLOR_UP if chg > 0
-                     else config.COLOR_DOWN if chg < 0 else config.COLOR_TEXT_DIM)
-            self._info_vals["change_pct"].setStyleSheet(
-                f"#infoVal {{ color:{color}; }}"
-            )
-
-    # ------------------------------------------------------------------
-    # 핸들러
-    # ------------------------------------------------------------------
-    def _on_type(self, key: str) -> None:
-        self._chart_type = key
-        self._render_main()
-
-    def _on_ma(self, period: int, on: bool) -> None:
-        self._ma[period] = on
-        item = self._ma_items.get(period)
-        if item is not None:
-            item.setVisible(on)
-
-    def _on_volume(self, on: bool) -> None:
-        self._volume = on
-        if self._vol_item is not None:
-            self._vol_item.setVisible(on)
-
-    def _on_period(self, key: str) -> None:
-        # 데이터 범위는 그대로(전체 히스토리). 선택 기간의 수익률만 강조.
-        self._period = key
-        self._render_returns()
-
-    def _toggle_info(self, on: bool) -> None:
-        self.info_panel.setVisible(on)
-
-    def _toggle_control(self) -> None:
-        self.control_bar.setVisible(not self.control_bar.isVisible())
+        # 커
