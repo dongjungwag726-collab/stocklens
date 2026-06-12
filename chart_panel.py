@@ -110,24 +110,27 @@ class CandlestickItem(pg.GraphicsObject):
     def _generate(self) -> None:
         self._picture = QPicture()
         painter = QPainter(self._picture)
-        up = QColor(config.COLOR_UP)
-        down = QColor(config.COLOR_DOWN)
-        half = 0.35
-        for i, b in enumerate(self._bars):
-            o, h, l, c = b["open"], b["high"], b["low"], b["close"]
-            if None in (o, h, l, c):
-                continue
-            color = up if c >= o else down
-            painter.setPen(pg.mkPen(color, width=1))
-            # 심지 (고가-저가)
-            painter.drawLine(QPointF(i, l), QPointF(i, h))
-            # 몸통 (시가-종가)
-            top, bot = max(o, c), min(o, c)
-            if top == bot:  # 도지: 얇은 선이라도 보이게
-                top = bot + max(abs(bot) * 1e-4, 1.0)
-            painter.setBrush(pg.mkBrush(color))
-            painter.drawRect(QRectF(i - half, bot, half * 2, top - bot))
-        painter.end()
+        try:
+            up = QColor(config.COLOR_UP)
+            down = QColor(config.COLOR_DOWN)
+            half = 0.35
+            for i, b in enumerate(self._bars):
+                o, h, l, c = (b.get("open"), b.get("high"),
+                              b.get("low"), b.get("close"))
+                if None in (o, h, l, c):
+                    continue
+                color = up if c >= o else down
+                painter.setPen(pg.mkPen(color, width=1))
+                # 심지 (고가-저가)
+                painter.drawLine(QPointF(i, l), QPointF(i, h))
+                # 몸통 (시가-종가)
+                top, bot = max(o, c), min(o, c)
+                if top == bot:  # 도지: 얇은 선이라도 보이게
+                    top = bot + max(abs(bot) * 1e-4, 1.0)
+                painter.setBrush(pg.mkBrush(color))
+                painter.drawRect(QRectF(i - half, bot, half * 2, top - bot))
+        finally:
+            painter.end()
 
     def paint(self, painter, *args) -> None:
         painter.drawPicture(0, 0, self._picture)
@@ -424,51 +427,72 @@ class ChartPanel(QWidget):
     def _track(self, thread) -> None:
         """실행 중 스레드를 참조 유지하고 종료 시 정리한다 (GC 방지)."""
         self._threads.append(thread)
-        thread.finished.connect(
-            lambda: self._threads.remove(thread)
-            if thread in self._threads else None
-        )
+        thread.finished.connect(self._on_thread_finished,
+                                Qt.ConnectionType.QueuedConnection)
+
+    def _on_thread_finished(self) -> None:
+        t = self.sender()
+        try:
+            if t in self._threads:
+                self._threads.remove(t)
+            if t is not None:
+                t.deleteLater()
+        except Exception as e:
+            print(f"[ChartPanel._on_thread_finished] {e!r}")
 
     def _fetch_chart(self) -> None:
         if not self._ticker:
             return
         self.title_lbl.setText(f"{self._name or self._ticker}  ⏳")
-        t = ChartFetchThread(self._ticker, self._name, self._period)
-        t.chart_ready.connect(self._on_chart)
+        # 워커 스레드 → 메인 스레드 슬롯은 반드시 QueuedConnection 으로 전달해
+        # UI/렌더링이 백그라운드 스레드에서 호출되지 않게 한다.
+        t = ChartFetchThread(self._ticker, self._name, self._period, parent=self)
+        t.chart_ready.connect(self._on_chart, Qt.ConnectionType.QueuedConnection)
         self._track(t)
         t.start()
 
     def _fetch_returns(self) -> None:
         if not self._ticker:
             return
-        t = ReturnsFetchThread(self._ticker)
-        t.returns_ready.connect(self._on_returns)
+        t = ReturnsFetchThread(self._ticker, parent=self)
+        t.returns_ready.connect(self._on_returns,
+                                Qt.ConnectionType.QueuedConnection)
         self._track(t)
         t.start()
 
     def _on_chart(self, result: dict) -> None:
-        # 이전 기간의 늦은 응답은 무시
-        if result.get("period") and result.get("period") != self._period:
-            return
-        name = result.get("name") or result.get("ticker", "")
-        if result.get("error"):
-            self.title_lbl.setText(f"{name}  (조회 실패)")
-        else:
-            self.title_lbl.setText(name)
+        # 메인 스레드에서 실행되는 슬롯. 예외가 새어나가면 Qt 이벤트 루프가
+        # 비정상 종료(무로그 크래시)할 수 있으므로 전부 감싼다.
+        try:
+            if not isinstance(result, dict):
+                return
+            # 이전 기간의 늦은 응답은 무시
+            if result.get("period") and result.get("period") != self._period:
+                return
+            name = result.get("name") or result.get("ticker", "")
+            if result.get("error"):
+                self.title_lbl.setText(f"{name}  (조회 실패)")
+            else:
+                self.title_lbl.setText(name)
 
-        self._bars = result.get("ohlcv", []) or []
-        self._times = [b["time"] for b in self._bars]
-        self._prev_close = result.get("prev_close")
-        self._intraday = bool(result.get("intraday", False))
-        self._axis_fmt = "%H:%M" if self._period == "1D" else "%m/%d"
+            self._bars = result.get("ohlcv", []) or []
+            self._times = [b["time"] for b in self._bars]
+            self._prev_close = result.get("prev_close")
+            self._intraday = bool(result.get("intraday", False))
+            self._axis_fmt = "%H:%M" if self._period == "1D" else "%m/%d"
 
-        self._render_all()
-        self._update_info(result.get("info", {}))
+            self._render_all()
+            self._update_info(result.get("info", {}) or {})
+        except Exception as e:
+            print(f"[ChartPanel._on_chart] {e!r}")
 
     def _on_returns(self, bars: list) -> None:
-        self._returns_bars = bars or []
-        self._compute_returns()
-        self._render_returns()
+        try:
+            self._returns_bars = bars or []
+            self._compute_returns()
+            self._render_returns()
+        except Exception as e:
+            print(f"[ChartPanel._on_returns] {e!r}")
 
     # ------------------------------------------------------------------
     # 기간별 등락률
@@ -520,16 +544,26 @@ class ChartPanel(QWidget):
     # ------------------------------------------------------------------
     # 렌더링
     # ------------------------------------------------------------------
+    def _vals(self, key: str) -> np.ndarray:
+        """봉 리스트에서 한 필드를 float 배열로 변환 (None → NaN)."""
+        return np.array(
+            [(b.get(key) if b.get(key) is not None else np.nan)
+             for b in self._bars], dtype=float
+        )
+
     def _render_all(self) -> None:
-        self.time_axis.set_times(self._times, self._axis_fmt)
-        self._render_volume()
-        self._render_ma()
-        self._render_main()
-        self._render_prev_line()
-        self._render_markers()
-        if self._bars:
-            self.price_plot.setXRange(-1, len(self._bars), padding=0.02)
-            self.price_plot.enableAutoRange(axis="y")
+        try:
+            self.time_axis.set_times(self._times, self._axis_fmt)
+            self._render_volume()
+            self._render_ma()
+            self._render_main()
+            self._render_prev_line()
+            self._render_markers()
+            if self._bars:
+                self.price_plot.setXRange(-1, len(self._bars), padding=0.02)
+                self.price_plot.enableAutoRange(axis="y")
+        except Exception as e:
+            print(f"[ChartPanel._render_all] {e!r}")
 
     def _clear_main(self) -> None:
         if self._main_item is not None:
@@ -541,21 +575,24 @@ class ChartPanel(QWidget):
         if not self._bars:
             return
         x = np.arange(len(self._bars))
-        closes = np.array([b["close"] for b in self._bars], dtype=float)
+        closes = self._vals("close")
 
         if self._chart_type == "candle":
             self._main_item = CandlestickItem(self._bars)
             self.price_plot.addItem(self._main_item)
         elif self._chart_type == "line":
             self._main_item = pg.PlotDataItem(
-                x, closes, pen=pg.mkPen(config.COLOR_UP, width=2)
+                x, closes, pen=pg.mkPen(config.COLOR_UP, width=2),
+                connect="finite"
             )
             self.price_plot.addItem(self._main_item)
         else:  # area
-            base = float(np.nanmin([b["low"] for b in self._bars]))
+            lows = self._vals("low")
+            base = float(np.nanmin(lows)) if np.any(np.isfinite(lows)) else 0.0
             self._main_item = pg.PlotDataItem(
                 x, closes, pen=pg.mkPen(config.COLOR_UP, width=2),
-                fillLevel=base, brush=pg.mkBrush(255, 75, 75, 60)
+                fillLevel=base, brush=pg.mkBrush(255, 75, 75, 60),
+                connect="finite"
             )
             self.price_plot.addItem(self._main_item)
 
@@ -566,7 +603,7 @@ class ChartPanel(QWidget):
         if not self._bars:
             return
         x = np.arange(len(self._bars))
-        closes = np.array([b["close"] for b in self._bars], dtype=float)
+        closes = self._vals("close")
         colors = {5: config.COLOR_MA5, 20: config.COLOR_MA20, 60: config.COLOR_MA60}
         for period, color in colors.items():
             y = _moving_average(closes, period)
@@ -584,12 +621,16 @@ class ChartPanel(QWidget):
         if not self._bars:
             return
         x = np.arange(len(self._bars))
-        heights = np.array([b.get("volume") or 0 for b in self._bars], dtype=float)
-        brushes = [
-            pg.mkBrush(255, 75, 75, 130) if b["close"] >= b["open"]
-            else pg.mkBrush(75, 139, 255, 130)
-            for b in self._bars
-        ]
+        heights = np.array([float(b.get("volume") or 0) for b in self._bars],
+                           dtype=float)
+        up_brush = pg.mkBrush(255, 75, 75, 130)
+        down_brush = pg.mkBrush(75, 139, 255, 130)
+        brushes = []
+        for b in self._bars:
+            o, c = b.get("open"), b.get("close")
+            # 시/종가가 없으면(분봉 결측) 상승색으로 처리
+            brushes.append(up_brush if (o is None or c is None or c >= o)
+                           else down_brush)
         self._vol_item = pg.BarGraphItem(x=x, height=heights, width=0.7,
                                          brushes=brushes, pen=None)
         self._vol_item.setVisible(self._volume)
@@ -615,16 +656,18 @@ class ChartPanel(QWidget):
         self._markers = []
         if not self._bars:
             return
-        highs = [b["high"] for b in self._bars]
-        lows = [b["low"] for b in self._bars]
-        hi_i = int(np.argmax(highs))
-        lo_i = int(np.argmin(lows))
-        hi = pg.TextItem(f"최고 {_won(highs[hi_i])}", color=config.COLOR_UP,
-                         anchor=(0.5, 1.2))
-        hi.setPos(hi_i, highs[hi_i])
-        lo = pg.TextItem(f"최저 {_won(lows[lo_i])}", color=config.COLOR_DOWN,
-                         anchor=(0.5, -0.2))
-        lo.setPos(lo_i, lows[lo_i])
+        highs = self._vals("high")
+        lows = self._vals("low")
+        if not (np.any(np.isfinite(highs)) and np.any(np.isfinite(lows))):
+            return
+        hi_i = int(np.nanargmax(highs))
+        lo_i = int(np.nanargmin(lows))
+        hi = pg.TextItem(f"최고 {_won(float(highs[hi_i]))}",
+                         color=config.COLOR_UP, anchor=(0.5, 1.2))
+        hi.setPos(hi_i, float(highs[hi_i]))
+        lo = pg.TextItem(f"최저 {_won(float(lows[lo_i]))}",
+                         color=config.COLOR_DOWN, anchor=(0.5, -0.2))
+        lo.setPos(lo_i, float(lows[lo_i]))
         for m in (hi, lo):
             m.setZValue(50)
             self.price_plot.addItem(m)
@@ -639,43 +682,48 @@ class ChartPanel(QWidget):
         self.tooltip.setVisible(on)
 
     def _on_mouse_moved(self, pos) -> None:
-        if not self._bars:
-            self._set_crosshair_visible(False)
-            return
-        vb = self.price_plot.vb
-        if not self.price_plot.sceneBoundingRect().contains(pos):
-            self._set_crosshair_visible(False)
-            return
-        mp = vb.mapSceneToView(pos)
-        i = int(round(mp.x()))
-        if i < 0 or i >= len(self._bars):
-            self._set_crosshair_visible(False)
-            return
+        try:
+            if not self._bars:
+                self._set_crosshair_visible(False)
+                return
+            vb = self.price_plot.vb
+            if not self.price_plot.sceneBoundingRect().contains(pos):
+                self._set_crosshair_visible(False)
+                return
+            mp = vb.mapSceneToView(pos)
+            i = int(round(mp.x()))
+            if i < 0 or i >= len(self._bars):
+                self._set_crosshair_visible(False)
+                return
 
-        b = self._bars[i]
-        self._set_crosshair_visible(True)
-        self.vline.setPos(i)
-        self.hline.setPos(mp.y())
+            b = self._bars[i]
+            self._set_crosshair_visible(True)
+            self.vline.setPos(i)
+            self.hline.setPos(mp.y())
 
-        chg = ((b["close"] - self._prev_close) / self._prev_close * 100.0
-               if self._prev_close else None)
-        d = datetime.fromtimestamp(b["time"])
-        t_str = d.strftime("%m/%d %H:%M" if self._intraday else "%Y-%m-%d")
-        chg_str = f"  ({chg:+.2f}%)" if chg is not None else ""
-        html = (
-            f"<div style='background:rgba(22,27,34,0.95);"
-            f"border:1px solid #30363D;padding:4px 6px;"
-            f"color:{config.COLOR_TEXT};font-size:11px;'>"
-            f"<span style='color:{config.COLOR_TEXT_DIM}'>{t_str}</span><br>"
-            f"시 {_won(b['open'])}  고 {_won(b['high'])}<br>"
-            f"저 {_won(b['low'])}  종 {_won(b['close'])}<br>"
-            f"거래량 {b.get('volume', 0):,}{chg_str}</div>"
-        )
-        self.tooltip.setHtml(html)
-        # 커서가 우측 절반이면 왼쪽으로 펼치도록 anchor 전환
-        right_half = i > len(self._bars) / 2
-        self.tooltip.setAnchor((1, 1) if right_half else (0, 1))
-        self.tooltip.setPos(i, mp.y())
+            close = b.get("close")
+            chg = ((close - self._prev_close) / self._prev_close * 100.0
+                   if (self._prev_close and close is not None) else None)
+            d = datetime.fromtimestamp(b["time"])
+            t_str = d.strftime("%m/%d %H:%M" if self._intraday else "%Y-%m-%d")
+            chg_str = f"  ({chg:+.2f}%)" if chg is not None else ""
+            vol = b.get("volume") or 0
+            html = (
+                f"<div style='background:rgba(22,27,34,0.95);"
+                f"border:1px solid #30363D;padding:4px 6px;"
+                f"color:{config.COLOR_TEXT};font-size:11px;'>"
+                f"<span style='color:{config.COLOR_TEXT_DIM}'>{t_str}</span><br>"
+                f"시 {_won(b.get('open'))}  고 {_won(b.get('high'))}<br>"
+                f"저 {_won(b.get('low'))}  종 {_won(close)}<br>"
+                f"거래량 {vol:,}{chg_str}</div>"
+            )
+            self.tooltip.setHtml(html)
+            # 커서가 우측 절반이면 왼쪽으로 펼치도록 anchor 전환
+            right_half = i > len(self._bars) / 2
+            self.tooltip.setAnchor((1, 1) if right_half else (0, 1))
+            self.tooltip.setPos(i, mp.y())
+        except Exception as e:
+            print(f"[ChartPanel._on_mouse_moved] {e!r}")
 
     # ------------------------------------------------------------------
     # 정보 패널
@@ -702,7 +750,10 @@ class ChartPanel(QWidget):
     # ------------------------------------------------------------------
     def _on_type(self, key: str) -> None:
         self._chart_type = key
-        self._render_main()
+        try:
+            self._render_main()
+        except Exception as e:
+            print(f"[ChartPanel._on_type] {e!r}")
 
     def _on_ma(self, period: int, on: bool) -> None:
         self._ma[period] = on
