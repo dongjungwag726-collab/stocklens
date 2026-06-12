@@ -1,3 +1,4 @@
+# data_fetcher.py
 """yfinance를 사용한 백그라운드 시세 조회 (QThread)."""
 
 from __future__ import annotations
@@ -115,33 +116,45 @@ def _to_int(v):
 # ---------------------------------------------------------------------------
 # 차트용 OHLCV 히스토리 조회
 # ---------------------------------------------------------------------------
-# 차트는 항상 전체 히스토리(1년 일봉)를 보여주고, 기간별 등락률은 이 데이터에서
-# 계산한다. (토스/키움 스타일: 기간 버튼은 데이터 범위가 아니라 수익률을 표시)
-CHART_HISTORY_PERIOD = "1y"
-CHART_HISTORY_INTERVAL = "1d"
+# 기간 키 → (yfinance period, interval)
+CHART_PERIODS = {
+    "1D": ("1d", "15m"),
+    "1W": ("7d", "1h"),
+    "1M": ("1mo", "1d"),
+    "3M": ("3mo", "1d"),
+    "1Y": ("1y", "1d"),
+    "ALL": ("max", "1d"),
+}
+# 분봉 간격 (intraday 판정용)
+INTRADAY_INTERVALS = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h"}
+
+# 등락률 라벨 계산용 기준 데이터 (항상 1년 일봉)
+RETURNS_PERIOD = "1y"
+RETURNS_INTERVAL = "1d"
 
 
 def _isnan(v) -> bool:
     return isinstance(v, float) and math.isnan(v)
 
 
-def fetch_chart(ticker: str, name: str) -> dict:
-    """차트 패널용 전체 OHLCV(1년 일봉) + 종목 정보를 조회한다.
+def fetch_chart(ticker: str, name: str, period_key: str) -> dict:
+    """차트 패널용 OHLCV(선택 기간/간격) + 종목 정보를 조회한다.
 
-    반환 dict: ohlcv(list), prev_close, intraday(bool), info(dict), error(bool)
-    time은 UNIX epoch(초)로 통일한다. 기간별 등락률은 호출 측에서 ohlcv로 계산.
+    반환 dict: period, ohlcv(list), prev_close, intraday(bool), info, error
+    time은 UNIX epoch(초)로 통일한다.
     """
     import yfinance as yf
 
+    period, interval = CHART_PERIODS.get(period_key, CHART_PERIODS["1M"])
+    intraday = interval in INTRADAY_INTERVALS
     out: dict = {
-        "ticker": ticker, "name": name,
-        "ohlcv": [], "prev_close": None, "intraday": False,
+        "ticker": ticker, "name": name, "period": period_key,
+        "ohlcv": [], "prev_close": None, "intraday": intraday,
         "info": {}, "error": False,
     }
     try:
         tk = yf.Ticker(ticker)
-        hist = tk.history(period=CHART_HISTORY_PERIOD,
-                          interval=CHART_HISTORY_INTERVAL)
+        hist = tk.history(period=period, interval=interval)
 
         # time(초) → bar. 중복 시각은 마지막 값으로 덮어써 오름차순·유일성 보장.
         by_time: dict[int, dict] = {}
@@ -220,18 +233,52 @@ def _build_info(tk, fi, ohlcv: list, prev: float | None) -> dict:
 
 
 class ChartFetchThread(QThread):
-    """단일 종목의 전체 OHLCV 히스토리를 백그라운드에서 조회."""
+    """단일 종목의 선택 기간 OHLCV 를 백그라운드에서 조회."""
 
     chart_ready = pyqtSignal(object)  # dict (fetch_chart 결과)
 
-    def __init__(self, ticker: str, name: str, parent=None) -> None:
+    def __init__(self, ticker: str, name: str, period_key: str,
+                 parent=None) -> None:
         super().__init__(parent)
         self._ticker = ticker
         self._name = name
+        self._period_key = period_key
 
     def run(self) -> None:
-        result = fetch_chart(self._ticker, self._name)
+        result = fetch_chart(self._ticker, self._name, self._period_key)
         self.chart_ready.emit(result)
+
+
+def fetch_returns(ticker: str) -> list[dict]:
+    """등락률 계산용 1년 일봉 종가 시계열. [{time, close}, ...] (오름차순)."""
+    import yfinance as yf
+
+    try:
+        tk = yf.Ticker(ticker)
+        hist = tk.history(period=RETURNS_PERIOD, interval=RETURNS_INTERVAL)
+        by_time: dict[int, dict] = {}
+        for idx, row in hist.iterrows():
+            close = _to_float(row.get("Close"))
+            if close is None or _isnan(row.get("Close")):
+                continue
+            t = int(idx.timestamp())
+            by_time[t] = {"time": t, "close": close}
+        return [by_time[t] for t in sorted(by_time)]
+    except Exception:
+        return []
+
+
+class ReturnsFetchThread(QThread):
+    """등락률 계산용 1년 일봉을 백그라운드에서 조회."""
+
+    returns_ready = pyqtSignal(object)  # list[dict]
+
+    def __init__(self, ticker: str, parent=None) -> None:
+        super().__init__(parent)
+        self._ticker = ticker
+
+    def run(self) -> None:
+        self.returns_ready.emit(fetch_returns(self._ticker))
 
 
 class FetchThread(QThread):
