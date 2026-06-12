@@ -1,4 +1,3 @@
-# data_fetcher.py
 """yfinance를 사용한 백그라운드 시세 조회 (QThread)."""
 
 from __future__ import annotations
@@ -245,8 +244,20 @@ class ChartFetchThread(QThread):
         self._period_key = period_key
 
     def run(self) -> None:
-        result = fetch_chart(self._ticker, self._name, self._period_key)
-        self.chart_ready.emit(result)
+        # 워커 스레드. 예외가 새어나가면 Qt가 무로그로 비정상 종료할 수 있으므로
+        # 절대 밖으로 던지지 않는다.
+        try:
+            result = fetch_chart(self._ticker, self._name, self._period_key)
+        except Exception:
+            result = {
+                "ticker": self._ticker, "name": self._name,
+                "period": self._period_key, "ohlcv": [], "prev_close": None,
+                "intraday": False, "info": {}, "error": True,
+            }
+        try:
+            self.chart_ready.emit(result)
+        except Exception:
+            pass
 
 
 def fetch_returns(ticker: str) -> list[dict]:
@@ -278,7 +289,14 @@ class ReturnsFetchThread(QThread):
         self._ticker = ticker
 
     def run(self) -> None:
-        self.returns_ready.emit(fetch_returns(self._ticker))
+        try:
+            bars = fetch_returns(self._ticker)
+        except Exception:
+            bars = []
+        try:
+            self.returns_ready.emit(bars)
+        except Exception:
+            pass
 
 
 class FetchThread(QThread):
@@ -295,10 +313,19 @@ class FetchThread(QThread):
 
     def run(self) -> None:
         results: list[Quote] = []
-        for entry in self._watchlist:
-            if self.isInterruptionRequested():
-                break
-            q = fetch_quote(entry["ticker"], entry.get("name", entry["ticker"]))
-            results.append(q)
-            self.quote_ready.emit(q)
-        self.finished_all.emit(results)
+        try:
+            for entry in self._watchlist:
+                if self.isInterruptionRequested():
+                    break
+                q = fetch_quote(
+                    entry["ticker"], entry.get("name", entry["ticker"])
+                )
+                results.append(q)
+                self.quote_ready.emit(q)
+        except Exception:
+            pass
+        finally:
+            try:
+                self.finished_all.emit(results)
+            except Exception:
+                pass
