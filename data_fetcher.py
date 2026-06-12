@@ -115,39 +115,33 @@ def _to_int(v):
 # ---------------------------------------------------------------------------
 # 차트용 OHLCV 히스토리 조회
 # ---------------------------------------------------------------------------
-# 기간 키 → (yfinance period, interval, 분봉 여부)
-CHART_PERIODS = {
-    "1D": ("1d", "5m", True),
-    "1W": ("5d", "30m", True),
-    "1M": ("1mo", "1d", False),
-    "3M": ("3mo", "1d", False),
-    "1Y": ("1y", "1d", False),
-}
+# 차트는 항상 전체 히스토리(1년 일봉)를 보여주고, 기간별 등락률은 이 데이터에서
+# 계산한다. (토스/키움 스타일: 기간 버튼은 데이터 범위가 아니라 수익률을 표시)
+CHART_HISTORY_PERIOD = "1y"
+CHART_HISTORY_INTERVAL = "1d"
 
 
 def _isnan(v) -> bool:
     return isinstance(v, float) and math.isnan(v)
 
 
-def fetch_chart(ticker: str, name: str, period_key: str) -> dict:
-    """차트 패널용 OHLCV + 종목 정보를 조회한다.
+def fetch_chart(ticker: str, name: str) -> dict:
+    """차트 패널용 전체 OHLCV(1년 일봉) + 종목 정보를 조회한다.
 
     반환 dict: ohlcv(list), prev_close, intraday(bool), info(dict), error(bool)
-    lightweight-charts에 바로 넘길 수 있도록 time은 UNIX epoch(초)로 통일한다.
+    time은 UNIX epoch(초)로 통일한다. 기간별 등락률은 호출 측에서 ohlcv로 계산.
     """
     import yfinance as yf
 
-    period, interval, intraday = CHART_PERIODS.get(
-        period_key, CHART_PERIODS["1M"]
-    )
     out: dict = {
-        "ticker": ticker, "name": name, "period": period_key,
-        "ohlcv": [], "prev_close": None, "intraday": intraday,
+        "ticker": ticker, "name": name,
+        "ohlcv": [], "prev_close": None, "intraday": False,
         "info": {}, "error": False,
     }
     try:
         tk = yf.Ticker(ticker)
-        hist = tk.history(period=period, interval=interval)
+        hist = tk.history(period=CHART_HISTORY_PERIOD,
+                          interval=CHART_HISTORY_INTERVAL)
 
         # time(초) → bar. 중복 시각은 마지막 값으로 덮어써 오름차순·유일성 보장.
         by_time: dict[int, dict] = {}
@@ -226,19 +220,17 @@ def _build_info(tk, fi, ohlcv: list, prev: float | None) -> dict:
 
 
 class ChartFetchThread(QThread):
-    """단일 종목의 OHLCV 히스토리를 백그라운드에서 조회."""
+    """단일 종목의 전체 OHLCV 히스토리를 백그라운드에서 조회."""
 
     chart_ready = pyqtSignal(object)  # dict (fetch_chart 결과)
 
-    def __init__(self, ticker: str, name: str, period_key: str,
-                 parent=None) -> None:
+    def __init__(self, ticker: str, name: str, parent=None) -> None:
         super().__init__(parent)
         self._ticker = ticker
         self._name = name
-        self._period_key = period_key
 
     def run(self) -> None:
-        result = fetch_chart(self._ticker, self._name, self._period_key)
+        result = fetch_chart(self._ticker, self._name)
         self.chart_ready.emit(result)
 
 
