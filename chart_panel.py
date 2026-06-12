@@ -14,7 +14,7 @@ from datetime import datetime
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QPointF, QRectF, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPicture
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -33,6 +33,15 @@ from data_fetcher import ChartFetchThread
 # pyqtgraph 전역 설정 (다크 테마)
 pg.setConfigOptions(antialias=True, background=config.COLOR_BG,
                     foreground=config.COLOR_TEXT)
+
+# 기간 (키, 표시 라벨, 등락률 계산용 calendar days)
+PERIODS = [
+    ("1D", "1일", 1),
+    ("1W", "1주", 7),
+    ("1M", "1개월", 30),
+    ("3M", "3개월", 90),
+    ("1Y", "1년", 365),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -171,11 +180,13 @@ class ChartPanel(QWidget):
 
         self._ticker: str | None = None
         self._name: str = ""
-        self._period = "1M"
+        self._period = "1D"
         self._chart_type = "candle"
         self._ma = {5: True, 20: True, 60: True}
         self._volume = True
         self._thread: ChartFetchThread | None = None
+        self._returns: dict[str, float] = {}
+        self._period_btns: dict = {}
 
         # 차트 데이터
         self._bars: list[dict] = []
@@ -299,14 +310,21 @@ class ChartPanel(QWidget):
         self.info_panel.setVisible(False)
         root.addWidget(self.info_panel)
 
-        # 기간 탭 (하단, 항상 표시)
+        # 기간별 등락률 라벨 (차트 아래, 항상 표시)
+        self.returns_lbl = QLabel("")
+        self.returns_lbl.setObjectName("returnsLbl")
+        self.returns_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.returns_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.returns_lbl.setWordWrap(True)
+        root.addWidget(self.returns_lbl)
+
+        # 기간 선택 탭 (하단). 데이터 범위가 아니라 '선택 기간 수익률 강조'용.
         period_bar = QHBoxLayout()
         period_bar.setContentsMargins(4, 2, 4, 4)
         period_bar.setSpacing(2)
         pg_group = QButtonGroup(self)
         pg_group.setExclusive(True)
-        for key, label in (("1D", "1일"), ("1W", "1주"), ("1M", "1개월"),
-                           ("3M", "3개월"), ("1Y", "1년")):
+        for key, label, _days in PERIODS:
             b = QPushButton(label)
             b.setObjectName("periodBtn")
             b.setCheckable(True)
@@ -314,11 +332,11 @@ class ChartPanel(QWidget):
             b.clicked.connect(lambda _=False, k=key: self._on_period(k))
             pg_group.addButton(b)
             period_bar.addWidget(b)
+            self._period_btns[key] = b
         root.addLayout(period_bar)
 
     def _build_chart(self) -> None:
         """가격/거래량 플롯, 크로스헤어, 툴팁을 1회 구성."""
-        grid = "#21262D"
         self.price_plot = self.view.addPlot(row=0, col=0)
         self.price_plot.showGrid(x=True, y=True, alpha=0.15)
         self.price_plot.hideAxis("bottom")
@@ -372,6 +390,8 @@ class ChartPanel(QWidget):
                 border-color: {config.COLOR_ACCENT};
             }}
             #periodBtn {{ padding: 3px 0; }}
+            #returnsLbl {{ color: {config.COLOR_TEXT_DIM}; font-size: 11px;
+                           padding: 1px 4px; }}
             #sep {{ color: #30363D; }}
             #infoCap {{ color: {config.COLOR_TEXT_DIM}; font-size: 10px; }}
             #infoVal {{ color: {config.COLOR_TEXT}; font-size: 12px; font-weight: 600; }}
@@ -395,7 +415,7 @@ class ChartPanel(QWidget):
         if self._thread is not None and self._thread.isRunning():
             return
         self.title_lbl.setText(f"{self._name or self._ticker}  ⏳")
-        self._thread = ChartFetchThread(self._ticker, self._name, self._period)
+        self._thread = ChartFetchThread(self._ticker, self._name)
         self._thread.chart_ready.connect(self._on_chart)
         self._thread.start()
 
@@ -413,6 +433,55 @@ class ChartPanel(QWidget):
 
         self._render_all()
         self._update_info(result.get("info", {}))
+        self._compute_returns()
+        self._render_returns()
+
+    # ------------------------------------------------------------------
+    # 기간별 등락률
+    # ------------------------------------------------------------------
+    def _compute_returns(self) -> None:
+        """전체 히스토리에서 각 기간(1D/1W/1M/3M/1Y) 등락률(%)을 계산."""
+        self._returns = {}
+        bars = self._bars
+        if len(bars) < 2:
+            return
+        last = bars[-1]
+        last_t, last_c = last["time"], last["close"]
+        if not last_c:
+            return
+        for key, _label, days in PERIODS:
+            target = last_t - days * 86400
+            past = None
+            # 오름차순 → target 이하 중 가장 최근 봉을 고른다 (마지막 봉 제외)
+            for b in bars[:-1]:
+                if b["time"] <= target:
+                    past = b
+                else:
+                    break
+            if past is None:  # 히스토리가 기간보다 짧으면 가장 오래된 봉 사용
+                past = bars[0]
+            base = past.get("close")
+            if base:
+                self._returns[key] = (last_c - base) / base * 100.0
+
+    def _render_returns(self) -> None:
+        """등락률 라벨을 그린다. 선택된 기간은 굵게 강조."""
+        parts = []
+        for key, label, _days in PERIODS:
+            pct = self._returns.get(key)
+            if pct is None:
+                seg = f"{label} -"
+            else:
+                color = (config.COLOR_UP if pct > 0
+                         else config.COLOR_DOWN if pct < 0
+                         else config.COLOR_TEXT_DIM)
+                sign = "+" if pct > 0 else ""
+                seg = (f"{label} <span style='color:{color}'>"
+                       f"{sign}{pct:.1f}%</span>")
+            if key == self._period:
+                seg = f"<b>{seg}</b>"
+            parts.append(seg)
+        self.returns_lbl.setText(" &nbsp;|&nbsp; ".join(parts))
 
     # ------------------------------------------------------------------
     # 렌더링
@@ -613,8 +682,9 @@ class ChartPanel(QWidget):
             self._vol_item.setVisible(on)
 
     def _on_period(self, key: str) -> None:
+        # 데이터 범위는 그대로(전체 히스토리). 선택 기간의 수익률만 강조.
         self._period = key
-        self._fetch()
+        self._render_returns()
 
     def _toggle_info(self, on: bool) -> None:
         self.info_panel.setVisible(on)
