@@ -1,11 +1,10 @@
-# chart_panel.py
 """슬라이딩 차트 패널 — pyqtgraph 렌더링.
 
 QWebEngineView 대신 pyqtgraph 로 네이티브 렌더링하여 Python 3.13 DLL 문제를 회피.
 오버레이 우측에서 펼쳐지는 토스증권 스타일 차트.
 - 캔들 / 선 / 영역 전환, MA5·MA20·MA60, 거래량, 전일 종가 기준선
 - 크로스헤어 OHLCV 툴팁, 최고/최저가 마커
-- 기간 탭(1일/1주/1개월/3개월/1년/전체), 마우스 휠 줌·드래그 스크롤(pyqtgraph 내장)
+- 기간 탭(1일/1주/1개월/3개월/1년), 마우스 휠 줌·드래그 스크롤(pyqtgraph 내장)
 - 차트 더블클릭 시 컨트롤 바 토글, '정보' 버튼으로 종목 정보 패널 토글
 """
 
@@ -330,7 +329,7 @@ class ChartPanel(QWidget):
         self.returns_lbl.setWordWrap(True)
         root.addWidget(self.returns_lbl)
 
-        # 기간 선택 탭 (하단). 선택 시 해당 기간/간격 데이터로 차트 재조회.
+        # 기간 선택 탭 (하단). 데이터 범위가 아니라 '선택 기간 수익률 강조'용.
         period_bar = QHBoxLayout()
         period_bar.setContentsMargins(4, 2, 4, 4)
         period_bar.setSpacing(2)
@@ -673,4 +672,56 @@ class ChartPanel(QWidget):
             f"거래량 {b.get('volume', 0):,}{chg_str}</div>"
         )
         self.tooltip.setHtml(html)
-        # 커
+        # 커서가 우측 절반이면 왼쪽으로 펼치도록 anchor 전환
+        right_half = i > len(self._bars) / 2
+        self.tooltip.setAnchor((1, 1) if right_half else (0, 1))
+        self.tooltip.setPos(i, mp.y())
+
+    # ------------------------------------------------------------------
+    # 정보 패널
+    # ------------------------------------------------------------------
+    def _update_info(self, info: dict) -> None:
+        fmt = {
+            "price": _won, "change_pct": _pct, "volume": _num,
+            "market_cap": _cap, "per": _ratio, "pbr": _ratio,
+            "w52_high": _won, "w52_low": _won,
+            "day_open": _won, "day_high": _won, "day_low": _won,
+        }
+        for key, lbl in self._info_vals.items():
+            lbl.setText(fmt.get(key, str)(info.get(key)))
+        chg = info.get("change_pct")
+        if "change_pct" in self._info_vals and isinstance(chg, (int, float)):
+            color = (config.COLOR_UP if chg > 0
+                     else config.COLOR_DOWN if chg < 0 else config.COLOR_TEXT_DIM)
+            self._info_vals["change_pct"].setStyleSheet(
+                f"#infoVal {{ color:{color}; }}"
+            )
+
+    # ------------------------------------------------------------------
+    # 핸들러
+    # ------------------------------------------------------------------
+    def _on_type(self, key: str) -> None:
+        self._chart_type = key
+        self._render_main()
+
+    def _on_ma(self, period: int, on: bool) -> None:
+        self._ma[period] = on
+        item = self._ma_items.get(period)
+        if item is not None:
+            item.setVisible(on)
+
+    def _on_volume(self, on: bool) -> None:
+        self._volume = on
+        if self._vol_item is not None:
+            self._vol_item.setVisible(on)
+
+    def _on_period(self, key: str) -> None:
+        self._period = key
+        self._render_returns()   # 선택 기간 강조
+        self._fetch_chart()      # 해당 기간/간격 데이터로 차트 재조회
+
+    def _toggle_info(self, on: bool) -> None:
+        self.info_panel.setVisible(on)
+
+    def _toggle_control(self) -> None:
+        self.control_bar.setVisible(not self.control_bar.isVisible())
